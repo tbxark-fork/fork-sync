@@ -1,0 +1,12 @@
+name: Sync fork repos
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: "10 * * * *"
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh auth login --with-token <<< "${{ secrets.CUSTOM_TOKEN }}"
+      - run: gh repo list tbxark-fork --fork --visibility public --json owner,name | jq -r 'map(.owner.login + "/" + .name) | .[]' | xargs -t -L1 gh repo sync --force
