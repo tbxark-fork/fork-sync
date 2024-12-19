@@ -8,5 +8,7 @@ jobs:
   comment:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
       - run: gh auth login --with-token <<< "${{ secrets.CUSTOM_TOKEN }}"
-      - run: gh repo list tbxark-fork --fork --visibility public --json owner,name | jq -r 'map(.owner.login + "/" + .name) | .[]' | xargs -t -L1 gh repo sync --force
+      - run: bash ./sync.sh
