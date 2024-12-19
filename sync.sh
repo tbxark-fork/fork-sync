@@ -2,7 +2,7 @@
 
 
 USERNAME="tbxark-fork"
-DELETE_UNTRACKED_BRANCHES="true"
+DELETE_UNTRACKED_BRANCHES="false"
 
 gh repo list $USERNAME --fork --visibility public --json owner,name | jq -r 'map(.owner.login + "/" + .name) | .[]' | while read FORK_REPO; do
     echo "Processing repository: $FORK_REPO"
