@@ -33,6 +33,10 @@ gh repo list $USERNAME --fork --visibility public --json owner,name | jq -r 'map
                 gh repo sync "$FORK_REPO" --branch "$branch" --source "$SOURCE_REPO" 
             else
                 echo "Creating and syncing new branch $branch"
+                if echo "$branch" | grep -q "$DELETE_BRANCH_NAME_FILTER"; then
+                    echo "Skipping branch $branch"
+                    continue
+                fi
                 sha=$(gh api "repos/$SOURCE_REPO/git/refs/heads/$branch" --jq '.object.sha')
                 gh api -X POST "repos/$FORK_REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$sha" > /dev/null
             fi
