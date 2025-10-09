@@ -10,5 +10,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - run: gh auth login --with-token <<< "${{ secrets.CUSTOM_TOKEN }}"
-      - run: bash ./sync.sh
+      - run: node ./sync.js
+        env:
+          SYNC_NON_INTERACTIVE: 1
