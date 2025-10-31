@@ -12,7 +12,7 @@ function envBool(name, def = false) {
 const ORG = process.env.SYNC_ORG || "tbxark-fork";
 const NON_INTERACTIVE = envBool("SYNC_NON_INTERACTIVE", false);
 const DELETE_REMOVED = envBool("SYNC_DELETE_REMOVED", false);
-const SYNC_FORCE = envBool("SYNC_FORCE", true);
+const SYNC_FORCE = envBool("SYNC_FORCE", false);
 
 function sh(cmd) {
   return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
