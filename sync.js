@@ -18,10 +18,10 @@ function sh(cmd) {
   return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
-async function ask(question) {
+async function ask(question, autoAnswer = DELETE_REMOVED ? "y" : "N") {
   if (NON_INTERACTIVE) {
-    console.log(`${question}${DELETE_REMOVED ? "y (auto)" : "N (auto)"}`);
-    return DELETE_REMOVED ? "y" : "N";
+    console.log(`${question}${autoAnswer} (auto)`);
+    return autoAnswer;
   }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
@@ -47,6 +47,17 @@ async function syncRepo(forkRepo, upstreamRepo) {
       sh(`gh repo sync ${forkRepo} --source ${upstreamRepo} --branch ${branch} ${SYNC_FORCE ? "--force" : ""}`);
     } catch (e) {
       console.error(`    !! failed to sync ${branch}: ${e.message}`);
+      if (!SYNC_FORCE) {
+        const ans = await ask(`    ? Force sync branch '${branch}' (y/N): `, "N");
+        if (/^y(es)?$/i.test(ans)) {
+          try {
+            sh(`gh repo sync ${forkRepo} --source ${upstreamRepo} --branch ${branch} --force`);
+            console.log(`    -> force synced ${branch}.`);
+          } catch (forceErr) {
+            console.error(`    !! force sync also failed for ${branch}: ${forceErr.message}`);
+          }
+        }
+      }
     }
   }
 
