@@ -19,6 +19,7 @@ node ./sync.js
 | --- | --- | --- |
 | `SYNC_ORG` | `tbxark-fork` | Organization/user whose public forks are synced. |
 | `SYNC_BRANCH_FILTER` | `^dependabot/\|^renovate/\|^copilot/\|^coderabbitai/\|^backups?/\|sparkle` | Branches matching this regex are never created in the fork, and are deleted without asking once they disappear upstream. |
+| `SYNC_PURGE_FILTERED` | `true` | Also delete branches already in the fork that match `SYNC_BRANCH_FILTER`, even while upstream still has them. The fork's default branch is never purged. Set to `false` to only block creation. |
 | `SYNC_MAX_BRANCHES` | `100` | Max sync/create operations per repo per run; the rest are deferred to the next run and listed in the report. |
 | `SYNC_CONCURRENCY` | `4` | Branch operations in flight per repository. |
 | `SYNC_REPO_LIMIT` | `1000` | Max repositories fetched from `gh repo list`. |

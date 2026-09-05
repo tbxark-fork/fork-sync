@@ -37,6 +37,10 @@ const CONFIG = {
       "^dependabot/|^renovate/|^copilot/|^coderabbitai/|^backups?/|sparkle",
     ),
   ),
+  // Without this, the filter only blocks *creation*: a matching branch that is
+  // already in the fork gets synced against upstream forever. Purging deletes
+  // it from the fork even while upstream still has it.
+  purgeFiltered: envBool("SYNC_PURGE_FILTERED", true),
   maxBranches: envInt("SYNC_MAX_BRANCHES", 100),
   concurrency: envInt("SYNC_CONCURRENCY", 4),
   repoLimit: envInt("SYNC_REPO_LIMIT", 1000),
@@ -163,7 +167,7 @@ async function listForks() {
     "--limit",
     String(CONFIG.repoLimit),
     "--json",
-    "owner,name,parent",
+    "owner,name,parent,defaultBranchRef",
   ]);
   if (!res.ok) throw new Error(`failed to list forks of ${CONFIG.org}: ${res.error}`);
   return JSON.parse(res.stdout);
@@ -239,14 +243,14 @@ async function createBranches(forkRepo, branches, upstream, stats) {
   });
 }
 
-async function deleteBranches(forkRepo, branches, stats) {
+async function deleteBranches(forkRepo, branches, stats, { reason, bucket, autoDelete }) {
   if (branches.length === 0) return;
-  log(`  -> ${branches.length} branch(es) exist in fork but not upstream`);
+  log(`  -> ${branches.length} branch(es) ${reason}`);
   for (const branch of branches) {
-    const autoDelete = CONFIG.deleteRemoved || CONFIG.skipPattern.test(branch);
+    const auto = autoDelete(branch);
     const answer = await ask(
-      `     ? Delete branch '${branch}' from ${forkRepo} (${autoDelete ? "Y/n" : "y/N"}): `,
-      autoDelete ? "y" : "N",
+      `     ? Delete branch '${branch}' from ${forkRepo} (${auto ? "Y/n" : "y/N"}): `,
+      auto ? "y" : "N",
     );
     if (!isYes(answer)) {
       log(`     -> kept '${branch}'`);
@@ -256,7 +260,7 @@ async function deleteBranches(forkRepo, branches, stats) {
     const res = await ghWrite(["api", "-X", "DELETE", `repos/${forkRepo}/git/refs/heads/${branch}`]);
     if (res.ok) {
       log(`     del ${branch}`);
-      stats.deleted.push(branch);
+      stats[bucket].push(branch);
     } else {
       warn(`     !! failed to delete ${branch} (protected or permission denied): ${res.error}`);
       stats.failed.push({ branch, action: "delete", error: res.error });
@@ -264,7 +268,7 @@ async function deleteBranches(forkRepo, branches, stats) {
   }
 }
 
-async function syncRepo(forkRepo, upstreamRepo) {
+async function syncRepo(forkRepo, upstreamRepo, defaultBranch) {
   log(`\n=== Sync ${forkRepo} from ${upstreamRepo} ===`);
   const stats = {
     repo: forkRepo,
@@ -273,6 +277,7 @@ async function syncRepo(forkRepo, upstreamRepo) {
     synced: [],
     created: [],
     deleted: [],
+    purged: [],
     kept: [],
     filtered: [],
     deferred: [],
@@ -281,10 +286,19 @@ async function syncRepo(forkRepo, upstreamRepo) {
 
   const [upstream, fork] = await Promise.all([listBranches(upstreamRepo), listBranches(forkRepo)]);
 
+  // Deleting the default branch would leave the fork headless, and no filter is
+  // worth that — keep it no matter what the pattern says.
+  const purgeable = (b) =>
+    CONFIG.purgeFiltered && b !== defaultBranch && CONFIG.skipPattern.test(b);
+  const toPurge = [...fork.keys()].filter(purgeable);
+  const purgeSet = new Set(toPurge);
+
   const toSync = [];
   const toCreate = [];
   for (const [branch, sha] of upstream) {
     if (fork.has(branch)) {
+      // Syncing a branch we're about to purge would just burn API calls.
+      if (purgeSet.has(branch)) continue;
       // Comparing SHAs first is what keeps this cheap: unchanged branches cost
       // zero API calls instead of one merge-upstream request each.
       if (fork.get(branch) === sha) stats.upToDate++;
@@ -295,17 +309,26 @@ async function syncRepo(forkRepo, upstreamRepo) {
       stats.filtered.push(branch);
     }
   }
-  const toDelete = [...fork.keys()].filter((b) => !upstream.has(b));
+  const toDelete = [...fork.keys()].filter((b) => !upstream.has(b) && !purgeSet.has(b));
 
   log(
     `  -> upstream ${upstream.size} / fork ${fork.size} branches: ` +
       `${stats.upToDate} up-to-date, ${toSync.length} to sync, ${toCreate.length} to create, ` +
-      `${toDelete.length} removed upstream, ${stats.filtered.length} filtered`,
+      `${toDelete.length} removed upstream, ${toPurge.length} to purge, ${stats.filtered.length} filtered`,
   );
 
   await syncExisting(forkRepo, upstreamRepo, cap(toSync, "sync", stats), stats);
   await createBranches(forkRepo, cap(toCreate, "create", stats), upstream, stats);
-  await deleteBranches(forkRepo, toDelete, stats);
+  await deleteBranches(forkRepo, toDelete, stats, {
+    reason: "exist in fork but not upstream",
+    bucket: "deleted",
+    autoDelete: (b) => CONFIG.deleteRemoved || CONFIG.skipPattern.test(b),
+  });
+  await deleteBranches(forkRepo, toPurge, stats, {
+    reason: `match the branch filter (purge)`,
+    bucket: "purged",
+    autoDelete: () => true,
+  });
 
   return stats;
 }
@@ -315,6 +338,25 @@ async function syncRepo(forkRepo, upstreamRepo) {
 function inlineCode(items, max = 12) {
   const head = items.slice(0, max).map((b) => `\`${b}\``).join(", ");
   return items.length > max ? `${head} … +${items.length - max} more` : head;
+}
+
+/** Encodes a ref for a GitHub URL path, keeping the `/` in `feat/foo` readable. */
+function refPath(branch) {
+  return branch.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * Links to what the fork branch has that upstream doesn't — i.e. exactly the
+ * commits `gh repo sync --force` would throw away. The three-part
+ * `owner:repo:branch` head is required because some forks were renamed and
+ * `owner:branch` would resolve against the wrong repository.
+ */
+function compareLink(forkRepo, upstreamRepo, branch) {
+  if (!branch || !upstreamRepo) return "—";
+  const [upOwner, upName] = upstreamRepo.split("/");
+  if (!upOwner || !upName) return "—";
+  const base = `${upOwner}:${upName}:${refPath(branch)}`;
+  return `[compare](https://github.com/${forkRepo}/compare/${base}...${refPath(branch)})`;
 }
 
 /** Collapses gh's multi-line stderr so it survives a markdown table/list. */
@@ -334,10 +376,11 @@ function buildReport({ started, finished, summary, aborted, fatal }) {
       synced: acc.synced + s.synced.length,
       created: acc.created + s.created.length,
       deleted: acc.deleted + s.deleted.length,
+      purged: acc.purged + s.purged.length,
       filtered: acc.filtered + s.filtered.length,
       failed: acc.failed + s.failed.length,
     }),
-    { synced: 0, created: 0, deleted: 0, filtered: 0, failed: 0 },
+    { synced: 0, created: 0, deleted: 0, purged: 0, filtered: 0, failed: 0 },
   );
 
   const out = [];
@@ -348,7 +391,7 @@ function buildReport({ started, finished, summary, aborted, fatal }) {
   out.push(
     `- **Result**: ${summary.length} repo(s) processed, ${aborted.length} aborted, ` +
       `${totals.synced} branch(es) synced, ${totals.created} created, ${totals.deleted} deleted, ` +
-      `${totals.filtered} filtered, ${totals.failed} failed`,
+      `${totals.purged} purged, ${totals.filtered} filtered, ${totals.failed} failed`,
   );
   out.push(`- **Branch filter**: \`${CONFIG.skipPattern.source}\``);
   if (fatal) out.push(`- **Run failed**: ${oneLine(fatal, 400)}`);
@@ -359,34 +402,45 @@ function buildReport({ started, finished, summary, aborted, fatal }) {
   // Failures go first: they're the only part of the report that needs action,
   // and they used to be buried per-repo at the bottom of ## Details.
   const failures = [
-    ...aborted.map((a) => ({ repo: a.repo, branch: "—", action: "repo aborted", error: a.error })),
-    ...summary.flatMap((s) => s.failed.map((f) => ({ repo: s.repo, ...f }))),
+    ...aborted.map((a) => ({ repo: a.repo, upstream: a.upstream, branch: null, action: "repo aborted", error: a.error })),
+    ...summary.flatMap((s) => s.failed.map((f) => ({ repo: s.repo, upstream: s.upstream, ...f }))),
   ];
   if (failures.length) {
     out.push(`## Failures (${failures.length})`, "");
-    out.push("| Fork | Branch | Action | Error |");
-    out.push("| --- | --- | --- | --- |");
+    out.push("| Fork | Branch | Action | Ahead of upstream | Error |");
+    out.push("| --- | --- | --- | --- | --- |");
     for (const f of failures) {
+      // A failed `create` never landed in the fork, so point at the upstream
+      // ref that does exist rather than emitting a 404.
+      const host = f.action === "create" ? f.upstream : f.repo;
+      const branchCell =
+        f.branch && host
+          ? `[\`${f.branch}\`](https://github.com/${host}/tree/${refPath(f.branch)})`
+          : f.branch
+            ? `\`${f.branch}\``
+            : "—";
+      const ahead = f.action === "create" ? "—" : compareLink(f.repo, f.upstream, f.branch);
       out.push(
-        `| [${f.repo}](https://github.com/${f.repo}) | \`${f.branch}\` | ${f.action} | ${oneLine(f.error)} |`,
+        `| [${f.repo}](https://github.com/${f.repo}) | ${branchCell} | ${f.action} | ` +
+          `${ahead} | ${oneLine(f.error)} |`,
       );
     }
     out.push("");
   }
 
   out.push("## Repositories", "");
-  out.push("| Fork | Upstream | Up-to-date | Synced | Created | Deleted | Filtered | Failed |");
-  out.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+  out.push("| Fork | Upstream | Up-to-date | Synced | Created | Deleted | Purged | Filtered | Failed |");
+  out.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
   for (const s of summary) {
     out.push(
       `| [${s.repo}](https://github.com/${s.repo}) | [${s.upstream}](https://github.com/${s.upstream}) | ` +
         `${s.upToDate} | ${s.synced.length} | ${s.created.length} | ${s.deleted.length} | ` +
-        `${s.filtered.length} | ${s.failed.length ? `**${s.failed.length}** ⚠️` : 0} |`,
+        `${s.purged.length} | ${s.filtered.length} | ${s.failed.length ? `**${s.failed.length}** ⚠️` : 0} |`,
     );
   }
   for (const a of aborted) {
     out.push(
-      `| [${a.repo}](https://github.com/${a.repo}) | ${a.upstream ?? "?"} | — | — | — | — | — | **aborted** ⚠️ |`,
+      `| [${a.repo}](https://github.com/${a.repo}) | ${a.upstream ?? "?"} | — | — | — | — | — | — | **aborted** ⚠️ |`,
     );
   }
   out.push("");
@@ -396,6 +450,7 @@ function buildReport({ started, finished, summary, aborted, fatal }) {
     ["Synced", (s) => s.synced],
     ["Created", (s) => s.created],
     ["Deleted", (s) => s.deleted],
+    ["Purged (filter)", (s) => s.purged],
     ["Kept", (s) => s.kept],
     ["Deferred to next run", (s) => s.deferred],
   ];
@@ -467,7 +522,7 @@ async function main() {
       const upstreamRepo = `${repo.parent.owner.login}/${repo.parent.name}`;
       try {
         // One broken repo must not abort the whole run.
-        summary.push(await syncRepo(forkRepo, upstreamRepo));
+        summary.push(await syncRepo(forkRepo, upstreamRepo, repo.defaultBranchRef?.name));
       } catch (err) {
         warn(`  !! ${forkRepo} aborted: ${err.message}`);
         aborted.push({ repo: forkRepo, upstream: upstreamRepo, error: err.message });
@@ -490,6 +545,7 @@ async function main() {
       s.synced.length && `${s.synced.length} synced`,
       s.created.length && `${s.created.length} created`,
       s.deleted.length && `${s.deleted.length} deleted`,
+      s.purged.length && `${s.purged.length} purged`,
       s.filtered.length && `${s.filtered.length} filtered`,
       s.failed.length && `${s.failed.length} failed`,
     ].filter(Boolean);
