@@ -74,11 +74,12 @@ async function gh(args) {
     });
     return { ok: true, stdout: stdout.trim(), error: "" };
   } catch (err) {
-    const error = [err.stderr, err.stdout, err.message]
-      .filter(Boolean)
-      .map((s) => String(s).trim())
-      .filter(Boolean)
-      .join(" | ");
+    // err.message re-echoes the whole command plus stderr, which crowds out the
+    // actual reason once it's truncated for the report. Prefer gh's own output.
+    const parts = [err.stderr, err.stdout]
+      .map((s) => String(s ?? "").trim())
+      .filter(Boolean);
+    const error = parts.length ? parts.join(" | ") : String(err.message ?? "").trim();
     return { ok: false, stdout: "", error };
   }
 }
@@ -355,6 +356,24 @@ function buildReport({ started, finished, summary, aborted, fatal }) {
   if (runUrl) out.push(`- **Workflow run**: ${runUrl}`);
   out.push("");
 
+  // Failures go first: they're the only part of the report that needs action,
+  // and they used to be buried per-repo at the bottom of ## Details.
+  const failures = [
+    ...aborted.map((a) => ({ repo: a.repo, branch: "—", action: "repo aborted", error: a.error })),
+    ...summary.flatMap((s) => s.failed.map((f) => ({ repo: s.repo, ...f }))),
+  ];
+  if (failures.length) {
+    out.push(`## Failures (${failures.length})`, "");
+    out.push("| Fork | Branch | Action | Error |");
+    out.push("| --- | --- | --- | --- |");
+    for (const f of failures) {
+      out.push(
+        `| [${f.repo}](https://github.com/${f.repo}) | \`${f.branch}\` | ${f.action} | ${oneLine(f.error)} |`,
+      );
+    }
+    out.push("");
+  }
+
   out.push("## Repositories", "");
   out.push("| Fork | Upstream | Up-to-date | Synced | Created | Deleted | Filtered | Failed |");
   out.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
@@ -362,38 +381,40 @@ function buildReport({ started, finished, summary, aborted, fatal }) {
     out.push(
       `| [${s.repo}](https://github.com/${s.repo}) | [${s.upstream}](https://github.com/${s.upstream}) | ` +
         `${s.upToDate} | ${s.synced.length} | ${s.created.length} | ${s.deleted.length} | ` +
-        `${s.filtered.length} | ${s.failed.length} |`,
+        `${s.filtered.length} | ${s.failed.length ? `**${s.failed.length}** ⚠️` : 0} |`,
     );
   }
   for (const a of aborted) {
-    out.push(`| [${a.repo}](https://github.com/${a.repo}) | ${a.upstream ?? "?"} | — | — | — | — | — | aborted |`);
+    out.push(
+      `| [${a.repo}](https://github.com/${a.repo}) | ${a.upstream ?? "?"} | — | — | — | — | — | **aborted** ⚠️ |`,
+    );
   }
   out.push("");
 
-  const changed = summary.filter(
-    (s) => s.synced.length || s.created.length || s.deleted.length || s.failed.length || s.deferred.length,
-  );
+  // Failures are already covered above, so they don't gate a repo's row here.
+  const ACTIONS = [
+    ["Synced", (s) => s.synced],
+    ["Created", (s) => s.created],
+    ["Deleted", (s) => s.deleted],
+    ["Kept", (s) => s.kept],
+    ["Deferred to next run", (s) => s.deferred],
+  ];
+  const changed = summary.filter((s) => ACTIONS.some(([, pick]) => pick(s).length));
   if (changed.length) {
     out.push("## Details", "");
+    out.push("| Fork | Action | Count | Branches |");
+    out.push("| --- | --- | ---: | --- |");
     for (const s of changed) {
-      out.push(`### ${s.repo} ← ${s.upstream}`, "");
-      if (s.synced.length) out.push(`- **Synced** (${s.synced.length}): ${inlineCode(s.synced)}`);
-      if (s.created.length) out.push(`- **Created** (${s.created.length}): ${inlineCode(s.created)}`);
-      if (s.deleted.length) out.push(`- **Deleted** (${s.deleted.length}): ${inlineCode(s.deleted)}`);
-      if (s.kept.length) out.push(`- **Kept** (${s.kept.length}): ${inlineCode(s.kept)}`);
-      if (s.deferred.length)
-        out.push(`- **Deferred to next run** (${s.deferred.length}): ${inlineCode(s.deferred)}`);
-      if (s.failed.length) {
-        out.push(`- **Failed** (${s.failed.length}):`);
-        for (const f of s.failed) out.push(`  - \`${f.branch}\` (${f.action}) — ${oneLine(f.error)}`);
+      // Only the first row of a repo carries the link; the blank cells below it
+      // read as a group instead of repeating the same URL five times.
+      let label = `[${s.repo}](https://github.com/${s.repo})`;
+      for (const [action, pick] of ACTIONS) {
+        const branches = pick(s);
+        if (!branches.length) continue;
+        out.push(`| ${label} | ${action} | ${branches.length} | ${inlineCode(branches)} |`);
+        label = "";
       }
-      out.push("");
     }
-  }
-
-  if (aborted.length) {
-    out.push("## Aborted", "");
-    for (const a of aborted) out.push(`- \`${a.repo}\` — ${oneLine(a.error)}`);
     out.push("");
   }
 
