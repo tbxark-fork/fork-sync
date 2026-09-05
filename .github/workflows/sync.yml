@@ -4,17 +4,46 @@ on:
     schedule:
         - cron: "10 * * * *"
 
+concurrency:
+  group: sync-forks
+  cancel-in-progress: false
+
 jobs:
-  comment:
+  sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          # Push with the PAT rather than GITHUB_TOKEN: commits authored by the
+          # token owner count as repository activity, which keeps GitHub from
+          # disabling this schedule after 60 days of inactivity.
+          token: ${{ secrets.CUSTOM_TOKEN }}
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: gh auth login --with-token <<< "${{ secrets.CUSTOM_TOKEN }}"
-      - run: node ./sync.js
+      - name: Sync forks
+        run: node ./sync.js
         env:
+          GH_TOKEN: ${{ secrets.CUSTOM_TOKEN }}
           SYNC_NON_INTERACTIVE: 1
+      - name: Commit sync report
+        if: always()
+        run: |
+          if [ ! -f SYNC.md ]; then
+            echo "No report was generated."
+            exit 0
+          fi
+          git config user.name "tbxark"
+          git config user.email "fork-sync@tbxark.com"
+          git add SYNC.md
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: update sync report ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          git pull --rebase --autostash
+          git push
