@@ -31,7 +31,12 @@ const CONFIG = {
   // deleted without asking once they disappear upstream. Upstream repos that
   // auto-generate branches (backups/*, dependabot/*, ...) would otherwise grow
   // the work list without bound on every run.
-  skipPattern: new RegExp(envStr("SYNC_BRANCH_FILTER", "^dependabot/|^renovate/|^backups?/|sparkle")),
+  skipPattern: new RegExp(
+    envStr(
+      "SYNC_BRANCH_FILTER",
+      "^dependabot/|^renovate/|^copilot/|^coderabbitai/|^backups?/|sparkle",
+    ),
+  ),
   maxBranches: envInt("SYNC_MAX_BRANCHES", 100),
   concurrency: envInt("SYNC_CONCURRENCY", 4),
   repoLimit: envInt("SYNC_REPO_LIMIT", 1000),
